@@ -1,102 +1,66 @@
-"use strict";
-
-// --- Configuration & Constants ---
-const MUST_WIN_BY_BID_KEY = "rookMustWinByBid";
-const TABLE_TALK_PENALTY_TYPE_KEY = "tableTalkPenaltyType";
-const TABLE_TALK_PENALTY_POINTS_KEY = "tableTalkPenaltyPoints";
-const ACTIVE_GAME_KEY = "activeGameState";
-const PRO_MODE_KEY = "proModeEnabled";
-const THEME_KEY = "rookSelectedTheme";
-const PRESET_BIDS_KEY = 'customPresetBids';
-const PROB_CACHE = new Map();   // memoise across calls
-const TEAM_STORAGE_VERSION = 2;
-const TEAM_KEY_SEPARATOR = "||";
-function sanitizeTotals(input) {
-  if (!input || typeof input !== 'object') return { us: 0, dem: 0 };
-  const parse = (value) => {
-    const num = Number(value);
-    return Number.isFinite(num) ? num : 0;
-  };
-  return { us: parse(input.us), dem: parse(input.dem) };
-}
-const DEFAULT_STATE = {
-  rounds: [], undoneRounds: [], biddingTeam: "", bidAmount: "",
-  customBidValue: "", showCustomBid: false, enterBidderPoints: false,
-  error: "", gameOver: false, winner: null, victoryMethod: null,
-  savedScoreInputStates: { us: null, dem: null }, lastBidAmount: null,
-  lastBidTeam: null,
-  usTeamName: "", demTeamName: "",
-  usPlayers: ["", ""], demPlayers: ["", ""],
-  startTime: null,
-  accumulatedTime: 0, showWinProbability: false, pendingPenalty: null,
-  timerLastSavedAt: null,
-  startingTotals: { us: 0, dem: 0 },
-};
-
-function sanitizePlayerName(name) {
-  return (typeof name === "string" ? name : "").trim().replace(/\s+/g, " ");
-}
-
-function ensurePlayersArray(input) {
-  const arr = Array.isArray(input) ? input : [];
-  return [sanitizePlayerName(arr[0] ?? ""), sanitizePlayerName(arr[1] ?? "")];
-}
-
-function canonicalizePlayers(players) {
-  const arr = ensurePlayersArray(players);
-  const nonEmpty = arr.filter(Boolean);
-  if (!nonEmpty.length) return arr;
-  const sorted = [...nonEmpty].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-  return [sorted[0] || '', sorted[1] || ''];
-}
-
-function formatTeamDisplay(players) {
-  const cleaned = ensurePlayersArray(players).filter(Boolean);
-  return cleaned.join(" & ");
-}
-
-function buildTeamKey(players) {
-  const cleaned = ensurePlayersArray(players)
-    .filter(Boolean)
-    .map(name => name.toLowerCase());
-  return cleaned.sort().join(TEAM_KEY_SEPARATOR);
-}
-
-function parseLegacyTeamName(teamName) {
-  const raw = sanitizePlayerName(teamName);
-  if (!raw) return ["", ""];
-  const separators = [/\s*&\s*/i, /\s+and\s+/i, /\s*\+\s*/i, /\s*\/\s*/, /\s*,\s*/];
-  for (const sep of separators) {
-    if (sep.test(raw)) {
-      const parts = raw.split(sep).map(sanitizePlayerName).filter(Boolean);
-      if (parts.length >= 2) return [parts[0], parts[1]];
-    }
-  }
-  return [raw, ""];
-}
-
-function deriveTeamDisplay(players, fallback = "") {
-  const display = formatTeamDisplay(players);
-  return display || fallback;
-}
-
-function getGameTeamDisplay(game, side) {
-  const fallback = side === 'us' ? 'Us' : 'Dem';
-  if (!game || (side !== 'us' && side !== 'dem')) return fallback;
-  const playersField = side === 'us' ? game.usPlayers || game.usTeamPlayers || game.usTeam : game.demPlayers || game.demTeamPlayers || game.demTeam;
-  const canonicalPlayers = canonicalizePlayers(playersField);
-  const nameField = side === 'us' ? (game.usTeamName || game.usName) : (game.demTeamName || game.demName);
-  return deriveTeamDisplay(canonicalPlayers, nameField || fallback) || fallback;
-}
-
-function playersEqual(a, b) {
-  const [a1, a2] = canonicalizePlayers(a);
-  const [b1, b2] = canonicalizePlayers(b);
-  return a1 === b1 && a2 === b2;
-}
+import {
+  MUST_WIN_BY_BID_KEY,
+  TABLE_TALK_PENALTY_TYPE_KEY,
+  TABLE_TALK_PENALTY_POINTS_KEY,
+  ACTIVE_GAME_KEY,
+  PRO_MODE_KEY,
+  PRESET_BIDS_KEY,
+  TEAM_STORAGE_VERSION,
+} from "./app/constants.js";
+import {
+  sanitizeTotals,
+  sanitizePlayerName,
+  ensurePlayersArray,
+  canonicalizePlayers,
+  formatTeamDisplay,
+  buildTeamKey,
+  parseLegacyTeamName,
+  deriveTeamDisplay,
+  getGameTeamDisplay,
+  playersEqual,
+} from "./app/utils.js";
+import {
+  calculateWinProbability,
+  renderProbabilityBreakdown,
+} from "./app/probability.js";
+import { setLocalStorage, getLocalStorage } from "./app/storage.js";
+import {
+  state,
+  mergeState,
+  resetState,
+  loadState,
+  saveState,
+  getBaseTotals,
+  getCurrentTotals,
+  getLastRunningTotals,
+  calculateSafeTimeAccumulation,
+  getCurrentGameTime,
+  MAX_GAME_TIME_MS,
+  MAX_ROUND_TIME_MS,
+} from "./app/state.js";
+import {
+  enforceDarkMode,
+  initializeTheme,
+  initializeCustomThemeColors,
+  applyCustomThemeColors,
+  resetThemeColors,
+  randomizeThemeColors,
+  updatePreview,
+  openThemeModal,
+  closeThemeModal,
+} from "./app/theme.js";
+import {
+  normalizeTeamsStorage,
+  getTeamsObject,
+  setTeamsObject,
+  ensureTeamEntry,
+  applyTeamResultDelta,
+  updateTeamsStatsOnGameEnd,
+  recalcTeamsStats,
+  addTeamIfNotExists,
+} from "./app/teams.js";
 
 // --- Global State ---
-let state = { ...DEFAULT_STATE };
 let confettiTriggered = false;
 let ephemeralCustomBid = ""; // For temporarily holding input value before state update
 let ephemeralPoints = "";    // Same for points
@@ -105,29 +69,6 @@ let noCallback = null;
 let pendingGameAction = null; // For actions requiring team name input first
 let statsViewMode = 'teams';
 let statsMetricKey = 'games';
-
-function getBaseTotals() {
-  return sanitizeTotals(state.startingTotals);
-}
-
-function getCurrentTotals() {
-  const base = getBaseTotals();
-  return state.rounds.reduce((acc, round) => {
-    const usPoints = Number(round.usPoints);
-    const demPoints = Number(round.demPoints);
-    return {
-      us: acc.us + (Number.isFinite(usPoints) ? usPoints : 0),
-      dem: acc.dem + (Number.isFinite(demPoints) ? demPoints : 0),
-    };
-  }, { ...base });
-}
-
-function getLastRunningTotals() {
-  if (state.rounds.length) {
-    return sanitizeTotals(state.rounds[state.rounds.length - 1].runningTotals);
-  }
-  return getBaseTotals();
-}
 
 let presetBids;
   try {
@@ -140,195 +81,7 @@ let presetBids;
 let scoreCardHasAnimated  = false;
 let historyCardHasAnimated = false;
 
-function renderWinProbability() {
-  // Only show if enabled
-  if (!state.showWinProbability) return "";
-
-  const { rounds, usTeamName, demTeamName, gameOver } = state;
-  if (rounds.length === 0 || gameOver) return "";
-  const historicalGames = getLocalStorage("savedGames");
-  const winProb = calculateWinProbability(state, historicalGames);
-  const labelUs = usTeamName || "Us";
-  const labelDem = demTeamName || "Dem";
-
-  // Get current game state for context
-  const lastRound = rounds[rounds.length - 1];
-  const currentScores = lastRound.runningTotals || { us: 0, dem: 0 };
-  const scoreDiff = currentScores.us - currentScores.dem;
-  const leader = scoreDiff > 0 ? labelUs : scoreDiff < 0 ? labelDem : "Tied";
-  const margin = Math.abs(scoreDiff);
-
-  // Determine win probability context
-  let contextText = "";
-  if (scoreDiff === 0) {
-    contextText = "Even game";
-  } else if (margin <= 30) {
-    contextText = `${leader} slightly ahead`;
-  } else if (margin <= 60) {
-    contextText = `${leader} leading`;
-  } else {
-    contextText = `${leader} strongly ahead`;
-  }
-
-  return `
-    <div id="winProbabilityDisplay" class="text-center text-sm text-gray-600 dark:text-gray-300 border-t border-gray-200 dark:border-gray-700 pt-3 mt-3">
-<div class="flex items-center justify-center gap-4 mb-2">
-  <div class="flex items-center gap-2">
-    <div class="w-2 h-2 rounded-full bg-primary"></div>
-    <span class="font-medium">${labelUs}: ${winProb.us.toFixed(1)}%</span>
-  </div>
-  <div class="flex items-center gap-2">
-    <div class="w-2 h-2 rounded-full bg-accent"></div>
-    <span class="font-medium">${labelDem}: ${winProb.dem.toFixed(1)}%</span>
-  </div>
-</div>
-<div class="text-xs text-gray-500 dark:text-gray-400">
-  ${contextText} • ${historicalGames.length} games analyzed
-</div>
-    </div>
-  `;
-}
-
-// --- Win‑probability engine -------------------------------------------
-
-function bucketScore(diff) {
-  const sign = diff < 0 ? -1 : 1;
-  const abs  = Math.min(Math.abs(diff), 180);   // ≥180 ⇒ final bucket
-  const band = Math.floor(abs / 20) * 20;       // 0‑19,20‑39,…160‑179
-  return sign * band;                           // e.g.  -40  or  120
-}
-
-function buildProbabilityIndex(historicalGames) {
-  const table = {};
-
-  const add = (k, winner, weight) => {
-    if (!table[k]) table[k] = { us: 1, dem: 1 };      // Laplace prior (1 | 1)
-    table[k][winner] += weight;
-  };
-
-  historicalGames.forEach(g => {
-    if (!g.rounds?.length || !g.finalScore) return;
-
-    const winner = g.finalScore.us > g.finalScore.dem ? 'us' : 'dem';
-    const ageDays = (Date.now() - new Date(g.timestamp)) / 86_400_000;
-    const w       = Math.pow(0.8, ageDays / 14);             // recency weight
-
-    g.rounds.forEach((r, idx) => {
-if (!r.runningTotals) return;
-const diff = r.runningTotals.us - r.runningTotals.dem;
-const key  = `${idx}|${bucketScore(diff)}`;
-add(key, winner, w);
-    });
-  });
-  return table;
-}
-
-// --- Calibrated logistic (trained 2025-06-20 on 44 games) -------------
-const L_INTERCEPT   =  0.2084586876141831;
-const L_COEFF_DIFF  =  0.00421107;
-const L_COEFF_ROUND = -0.09520921;
-const L_COEFF_MOM   =  0.00149416;
-
-function logisticProb(diff, roundIdx, mom) {
-  const z = L_INTERCEPT +
-      L_COEFF_DIFF  * diff +
-      L_COEFF_ROUND * roundIdx +
-      L_COEFF_MOM   * mom;
-  return 1 / (1 + Math.exp(-z));           // probability "us" eventually wins
-}
-
-/**
- * SHARPENED: Calculates win probability by blending historical empirical data
- * with a logistic regression model for a more robust and accurate prediction.
- */
-function calculateWinProbabilityComplex(state, historicalGames) {
-  // ---------------- Guards & Setup ----------------
-  const { rounds } = state;
-  if (!rounds?.length) return { us: 50, dem: 50 }; // No rounds played yet, 50/50 chance.
-
-  const lastRound = rounds[rounds.length - 1];
-  const roundIndex = rounds.length - 1;
-  const currentDiff = lastRound.runningTotals.us - lastRound.runningTotals.dem;
-
-  // ---------------- 1. Empirical Probability (from Historical Data) ----------------
-  // Get the pre-computed index of historical game outcomes.
-  // We use memoization (PROB_CACHE) to avoid rebuilding this on every single call.
-  const cacheKey = historicalGames.length;
-  if (!PROB_CACHE.has(cacheKey)) {
-    PROB_CACHE.set(cacheKey, buildProbabilityIndex(historicalGames));
-  }
-  const table = PROB_CACHE.get(cacheKey);
-
-  // Find the result for the current game situation (round index + bucketed score difference).
-  const key = `${roundIndex}|${bucketScore(currentDiff)}`;
-  const counts = table[key] || { us: 1, dem: 1 }; // Use Laplace prior (1,1) if no data.
-  const empiricalProbUs = counts.us / (counts.us + counts.dem);
-
-  // Count how many actual past games fall into this bucket (before our +1 prior).
-  const observationsInBucket = (counts.us - 1) + (counts.dem - 1);
-
-  // ---------------- 2. Model-Based Probability (Logistic Regression) ----------------
-  // Calculate momentum (change in score difference from the previous round).
-  const prevRound = rounds.length > 1 ? rounds[rounds.length - 2] : { runningTotals: { us: 0, dem: 0 } };
-  const prevDiff = prevRound.runningTotals.us - prevRound.runningTotals.dem;
-  const momentum = currentDiff - prevDiff;
-
-  // Get the "smoothed" probability from your trained logistic model.
-  const modelProbUs = logisticProb(currentDiff, roundIndex, momentum);
-
-  // ---------------- 3. Blending with Credibility Weighting (The Core Improvement) ----------------
-  // Create a weight 'beta' that determines how much we trust the empirical data.
-  // The more data we have for a situation (observationsInBucket), the higher the weight.
-  // If we have no data, the weight is 0, and we rely 100% on the logistic model.
-
-  // K is the number of observations at which we are 'fully confident' in the empirical data.
-  // A value of 30 means after 30 similar past situations, we heavily trust the historical record.
-  const K_CONFIDENCE_THRESHOLD = 30; 
-  const beta = Math.min(1, Math.log(observationsInBucket + 1) / Math.log(K_CONFIDENCE_THRESHOLD + 1));
-
-  // The final probability is a weighted average of the two approaches.
-  const blendedProbUs = (beta * empiricalProbUs) + ((1 - beta) * modelProbUs);
-
-  return {
-    us: +(blendedProbUs * 100).toFixed(1),
-    dem: +((1 - blendedProbUs) * 100).toFixed(1)
-  };
-}
-
-function calculateWinProbability(state, historicalGames) {
-  return calculateWinProbabilityComplex(state, historicalGames);
-}
-
-
-// --- Local Storage & Sync ---
-function setLocalStorage(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-    if (window.syncToFirestore && window.firebaseReady && window.firebaseAuth?.currentUser) {
-      // Non-blocking sync
-      setTimeout(() => {
-        window.syncToFirestore(key, value).catch(err => console.warn(`Firestore sync failed for ${key}:`, err));
-      }, 0);
-    }
-  } catch (error) {
-    console.error(`Error in setLocalStorage for key ${key}:`, error);
-  }
-}
-
-function getLocalStorage(key, defaultValue = null) {
-  const raw = localStorage.getItem(key);
-  if (raw === null) {
-    if (defaultValue !== null) return defaultValue;
-    if (key === "savedGames" || key === "freezerGames") return [];
-    return {};
-  }
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    return raw;
-  }
-}
-
+// --- Win-probability engine -------------------------------------------
 
 // --- Icons ---
 const Icons = { // SVG strings for icons to avoid multiple DOM elements
@@ -345,7 +98,9 @@ function savePresetBids() { setLocalStorage(PRESET_BIDS_KEY, presetBids); }
 function openPresetEditorModal() {
   // No longer restrict to Pro Mode
   const settingsModal = document.getElementById("settingsModal");
-  settingsModal?.classList.add("hidden");
+  if (settingsModal) {
+    settingsModal.classList.add("hidden");
+  }
 
   const existingModal = document.getElementById("presetEditorModal");
   if (existingModal) existingModal.remove();
@@ -397,7 +152,9 @@ function closePresetEditorModal() {
     modal.remove();
   }
   const settingsModal = document.getElementById("settingsModal");
-  if (settingsModal) settingsModal.classList.remove("hidden");
+  if (settingsModal) {
+    settingsModal.classList.remove("hidden");
+  }
   deactivateModalEnvironment();
 }
 
@@ -435,7 +192,10 @@ function removePreset(index) {
       setTimeout(() => errorMsgEl.classList.add('hidden'), 3000);
       return;
   }
-  const rowToRemove = Array.from(rows).find(r => r.querySelector('input[data-index]')?.dataset.index == index);
+  const rowToRemove = Array.from(rows).find(r => {
+      const input = r.querySelector('input[data-index]');
+      return input && input.dataset.index == index;
+  });
   if (rowToRemove) {
       rowToRemove.classList.add('animate-fadeOut');
       setTimeout(() => {
@@ -447,18 +207,6 @@ function removePreset(index) {
           });
       }, 150);
   }
-}
-function sortPresets() {
-  const inputs = Array.from(document.querySelectorAll('#presetInputs input'));
-  const errorMsgEl = document.getElementById('presetErrorMsg');
-  if (inputs.some(input => !validatePresetInput(input))) {
-      errorMsgEl.textContent = 'Fix errors before sorting.';
-      errorMsgEl.classList.remove('hidden');
-      setTimeout(() => errorMsgEl.classList.add('hidden'), 3000);
-      return;
-  }
-  const sortedValues = inputs.map(input => Number(input.value)).sort((a, b) => a - b);
-  inputs.forEach((input, i) => input.value = sortedValues[i]);
 }
 function savePresets() {
   const inputs = Array.from(document.querySelectorAll('#presetInputs input'));
@@ -487,197 +235,6 @@ function savePresets() {
 }
 
 // --- Theme & UI Helpers ---
-function enforceDarkMode() {
-  const root = document.documentElement;
-  if (!root.classList.contains("dark")) {
-    root.classList.add("dark");
-  }
-  const metaTheme = document.querySelector('meta[name="theme-color"]');
-  if (metaTheme) metaTheme.setAttribute("content", "#111827");
-  // Remove legacy flag so we're not tempted to read it elsewhere.
-  localStorage.removeItem("darkModeEnabled");
-}
-function initializeTheme() {
-  const body = document.getElementById("bodyRoot") || document.body;
-
-  // Classes that must ALWAYS be present, no matter which theme is selected
-  const BASE_BODY_CLASSES = [
-    "bg-gray-900",
-    "text-white",
-    "min-h-screen",
-    "transition-colors", "duration-300",
-    "liquid-glass"
-  ];
-  const baseClassString = BASE_BODY_CLASSES.join(" ");
-
-  const ensureBaseClasses = (themeString) => {
-    const tokens = new Set((themeString || "").split(/\s+/).filter(Boolean));
-    let mutated = false;
-    const deprecated = ["bg-white", "text-gray-800", "dark:bg-gray-900", "dark:text-white"];
-    for (const cls of deprecated) {
-      if (tokens.delete(cls)) mutated = true;
-    }
-    for (const cls of BASE_BODY_CLASSES) {
-      if (!tokens.has(cls)) {
-        tokens.add(cls);
-        mutated = true;
-      }
-    }
-    return { normalized: Array.from(tokens).join(" "), mutated };
-  };
-
-  // ------------------------------------------------------------------
-  //  One-time migration for themes stored by older app versions
-  // ------------------------------------------------------------------
-  let savedTheme = localStorage.getItem("rookSelectedTheme");
-
-  if (savedTheme) {
-    const { normalized, mutated } = ensureBaseClasses(savedTheme);
-    if (mutated && normalized !== savedTheme) {
-      localStorage.setItem("rookSelectedTheme", normalized);
-    }
-    body.className = normalized;
-    return;
-  }
-
-  // ------------------------------------------------------------------
-  //  Apply the theme (or fall back to default)
-  // ------------------------------------------------------------------
-  // First launch / user has never customised a theme
-  body.className = `${baseClassString} theme-blue-red`.trim();
-}
-function isValidHexColor(colorString) {
-  if (!colorString || typeof colorString !== 'string') return false;
-  // Basic hex color validation (e.g., #RRGGBB or #RGB)
-  return /^#([0-9A-F]{3}){1,2}$/i.test(colorString);
-}
-
-function sanitizeHexColor(colorString) {
-  if (typeof colorString !== 'string') return '';
-  const trimmed = colorString.trim();
-  if (!trimmed) return '';
-  const withoutQuotes = trimmed.replace(/^['"]+|['"]+$/g, '');
-  if (!withoutQuotes) return '';
-  const candidate = withoutQuotes.startsWith('#') ? withoutQuotes : `#${withoutQuotes}`;
-  return isValidHexColor(candidate) ? candidate : '';
-}
-
-function initializeCustomThemeColors() {
-  const rootStyles = getComputedStyle(document.documentElement);
-  const defaultUsColor = rootStyles.getPropertyValue('--primary-color').trim() || "#3b82f6";
-  const defaultDemColor = rootStyles.getPropertyValue('--accent-color').trim() || "#ef4444";
-
-  const storedUsColor = localStorage.getItem('customUsColor');
-  const storedDemColor = localStorage.getItem('customDemColor');
-
-  const body = document.getElementById('bodyRoot');
-  const usPicker = document.getElementById('usColorPicker');
-  const demPicker = document.getElementById('demColorPicker');
-
-  const usColor = sanitizeHexColor(storedUsColor);
-  if (usColor) {
-    if (storedUsColor !== usColor) localStorage.setItem('customUsColor', usColor);
-    if (body) body.style.setProperty('--primary-color', usColor);
-    if (usPicker) usPicker.value = usColor;
-  } else {
-    if (storedUsColor !== null) { // Warn only when a value existed
-      console.warn(`Invalid customUsColor ("${storedUsColor}") in localStorage. Using default.`);
-      localStorage.removeItem('customUsColor');
-    }
-    if (body) body.style.setProperty('--primary-color', defaultUsColor);
-    if (usPicker) usPicker.value = defaultUsColor;
-  }
-
-  const demColor = sanitizeHexColor(storedDemColor);
-  if (demColor) {
-    if (storedDemColor !== demColor) localStorage.setItem('customDemColor', demColor);
-    if (body) body.style.setProperty('--accent-color', demColor);
-    if (demPicker) demPicker.value = demColor;
-  } else {
-    if (storedDemColor !== null) {
-      console.warn(`Invalid customDemColor ("${storedDemColor}") in localStorage. Using default.`);
-      localStorage.removeItem('customDemColor');
-    }
-    if (body) body.style.setProperty('--accent-color', defaultDemColor);
-    if (demPicker) demPicker.value = defaultDemColor;
-  }
-  updatePreview(); // Ensure preview matches
-}
-function applyCustomThemeColors() {
-  const body = document.getElementById('bodyRoot');
-  const usPicker = document.getElementById('usColorPicker');
-  const demPicker = document.getElementById('demColorPicker');
-
-  const usColor = sanitizeHexColor(usPicker ? usPicker.value : '');
-  const demColor = sanitizeHexColor(demPicker ? demPicker.value : '');
-
-  if (usColor) {
-    if (body) body.style.setProperty('--primary-color', usColor);
-    localStorage.setItem('customUsColor', usColor);
-  } else {
-    localStorage.removeItem('customUsColor');
-  }
-
-  if (demColor) {
-    if (body) body.style.setProperty('--accent-color', demColor);
-    localStorage.setItem('customDemColor', demColor);
-  } else {
-    localStorage.removeItem('customDemColor');
-  }
-
-  closeThemeModal(null); // Pass null if event is not available or needed
-}
-function resetThemeColors() {
-  const defaultUs = "#3b82f6", defaultDem = "#ef4444";
-  document.getElementById('bodyRoot').style.setProperty('--primary-color', defaultUs);
-  document.getElementById('bodyRoot').style.setProperty('--accent-color', defaultDem);
-  localStorage.removeItem('customUsColor');
-  localStorage.removeItem('customDemColor');
-  const usPicker = document.getElementById('usColorPicker');
-  const demPicker = document.getElementById('demColorPicker');
-  if (usPicker) usPicker.value = defaultUs;
-  if (demPicker) demPicker.value = defaultDem;
-  updatePreview();
-}
-function hslToHex(h, s, l) { // Helper for random colors
-  s /= 100; l /= 100;
-  const k = n => (n + h / 30) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-  return "#" + [0, 8, 4].map(n => Math.round(f(n) * 255).toString(16).padStart(2, '0')).join('');
-}
-function randomizeThemeColors() {
-  const h = Math.floor(Math.random() * 360);
-  const s = Math.floor(Math.random() * 51) + 50; // Saturation 50-100%
-  const l = Math.floor(Math.random() * 41) + 30; // Lightness 30-70%
-  document.getElementById('usColorPicker').value = hslToHex(h, s, l);
-  document.getElementById('demColorPicker').value = hslToHex((h + 180) % 360, s, l); // Complementary
-  updatePreview();
-}
-function updatePreview() {
-  const usColor = document.getElementById('usColorPicker')?.value;
-  const demColor = document.getElementById('demColorPicker')?.value;
-  const previewUs = document.getElementById('previewUs');
-  const previewDem = document.getElementById('previewDem');
-  if (previewUs && usColor) previewUs.style.backgroundColor = usColor;
-  if (previewDem && demColor) previewDem.style.backgroundColor = demColor;
-}
- function openThemeModal(event) {
-  if (event) { event.preventDefault(); event.stopPropagation(); }
-  document.getElementById("settingsModal")?.classList.add("hidden");
-  const themeModalEl = document.getElementById("themeModal");
-  if (themeModalEl) {
-      themeModalEl.classList.remove("hidden");
-      const content = themeModalEl.querySelector(".bg-white, .dark\\:bg-gray-800");
-      if (content) content.onclick = e => e.stopPropagation(); // Prevent closing on content click
-      initializeCustomThemeColors(); // Ensure pickers and preview are up-to-date
-  }
-}
-function closeThemeModal(event) {
-  if (event) { event.preventDefault(); event.stopPropagation(); }
-  document.getElementById("themeModal")?.classList.add("hidden");
-  document.getElementById("settingsModal")?.classList.remove("hidden"); // Show settings modal again
-}
 function showSaveIndicator(message = "Saved") {
   const el = document.getElementById("saveIndicator");
   if (!el) return;
@@ -689,340 +246,40 @@ function showSaveIndicator(message = "Saved") {
 
 // --- Game State Management ---
 function updateState(newState) {
-  const nextState = { ...newState };
-
-  const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
-
-  if (has(nextState, 'usPlayers')) {
-    nextState.usPlayers = ensurePlayersArray(nextState.usPlayers);
-    if (!has(nextState, 'usTeamName')) {
-      nextState.usTeamName = deriveTeamDisplay(nextState.usPlayers);
-    }
-  } else if (has(nextState, 'usTeamName')) {
-    const parsed = parseLegacyTeamName(nextState.usTeamName);
-    nextState.usPlayers = ensurePlayersArray(parsed);
-    nextState.usTeamName = deriveTeamDisplay(parsed, nextState.usTeamName);
-  }
-
-  if (has(nextState, 'demPlayers')) {
-    nextState.demPlayers = ensurePlayersArray(nextState.demPlayers);
-    if (!has(nextState, 'demTeamName')) {
-      nextState.demTeamName = deriveTeamDisplay(nextState.demPlayers);
-    }
-  } else if (has(nextState, 'demTeamName')) {
-    const parsed = parseLegacyTeamName(nextState.demTeamName);
-    nextState.demPlayers = ensurePlayersArray(parsed);
-    nextState.demTeamName = deriveTeamDisplay(parsed, nextState.demTeamName);
-  }
-
-  if (has(nextState, 'startingTotals')) {
-    nextState.startingTotals = sanitizeTotals(nextState.startingTotals);
-  }
-
-  state = { ...state, ...nextState };
+  mergeState(newState);
   renderApp();
 }
+
 function resetGame() {
   const isProMode = JSON.parse(localStorage.getItem(PRO_MODE_KEY) || "false");
-  updateState({
-    ...DEFAULT_STATE,
-    usTeamName : "",      // blank ⇒ UI falls back to "Us"
-    demTeamName: "",      // blank ⇒ UI falls back to "Dem"
-    showWinProbability: isProMode,
-    pendingPenalty : null
-  });
+  resetState({ showWinProbability: isProMode });
   confettiTriggered = false;
   ephemeralCustomBid = "";
   ephemeralPoints = "";
   localStorage.removeItem(ACTIVE_GAME_KEY);
-  // Attempt to also clear from Firebase if user is signed in
-  if (window.syncToFirestore && window.firebaseReady && window.firebaseAuth?.currentUser) {
-      window.syncToFirestore(ACTIVE_GAME_KEY, null); // Sync deletion of active game
+  if (
+    window.syncToFirestore &&
+    window.firebaseReady &&
+    window.firebaseAuth &&
+    window.firebaseAuth.currentUser
+  ) {
+    window.syncToFirestore(ACTIVE_GAME_KEY, null);
   }
+  renderApp();
 }
+
 function loadCurrentGameState() {
-  let loadedState = null; // Initialize to null
-  try {
-    const storedStateString = localStorage.getItem(ACTIVE_GAME_KEY);
-    if (storedStateString) {
-loadedState = JSON.parse(storedStateString);
-    }
-  } catch (e) {
-    console.error("Error parsing activeGameState from localStorage. Will reset to default state.", e);
-    localStorage.removeItem(ACTIVE_GAME_KEY); // Critical: remove the corrupted state
-    // loadedState remains null, so it will fall through to using DEFAULT_STATE
-  }
-
-  if (loadedState && typeof loadedState === 'object' && loadedState !== null) {
-    // Ensure all DEFAULT_STATE keys are present, preferring loaded values
-    const completeLoadedState = { ...DEFAULT_STATE, ...loadedState };
-    completeLoadedState.rounds = Array.isArray(loadedState.rounds) ? loadedState.rounds : [];
-    completeLoadedState.undoneRounds = Array.isArray(loadedState.undoneRounds) ? loadedState.undoneRounds : [];
-    const now = Date.now();
-    const hasRounds = Array.isArray(completeLoadedState.rounds) && completeLoadedState.rounds.length > 0;
-    const timerWasRunning = typeof completeLoadedState.startTime === 'number' && !completeLoadedState.gameOver && hasRounds;
-    const storedAccumulated = Number(completeLoadedState.accumulatedTime);
-    const sanitizedAccumulated = Number.isFinite(storedAccumulated) && storedAccumulated >= 0 ? storedAccumulated : 0;
-
-    if (timerWasRunning) {
-if (typeof completeLoadedState.timerLastSavedAt !== 'number') {
-  // Legacy snapshots did not pre-accumulate time; cap what we add just in case.
-  completeLoadedState.accumulatedTime = calculateSafeTimeAccumulation(sanitizedAccumulated, completeLoadedState.startTime);
-} else {
-  completeLoadedState.accumulatedTime = Math.min(sanitizedAccumulated, MAX_GAME_TIME_MS);
+  loadState();
+  renderApp();
 }
-completeLoadedState.startTime = now; // Resume timer from now so offline time is not double-counted.
-    } else {
-completeLoadedState.accumulatedTime = Math.min(sanitizedAccumulated, MAX_GAME_TIME_MS);
-completeLoadedState.startTime = null;
-    }
 
-    completeLoadedState.timerLastSavedAt = now;
-    // Ensure showWinProbability is correctly set from localStorage PRO_MODE_KEY
-    completeLoadedState.showWinProbability = JSON.parse(localStorage.getItem(PRO_MODE_KEY) || "false"); // Add try-catch for this too
-    completeLoadedState.startingTotals = sanitizeTotals(completeLoadedState.startingTotals);
-    updateState(completeLoadedState);
-  } else {
-    if (loadedState) {
-      localStorage.removeItem(ACTIVE_GAME_KEY); // Remove invalid structure
-    }
-    // Fallback to default state
-    updateState({
-...DEFAULT_STATE,
-usTeamName: "", // Or load from a separate team name storage if you have one
-demTeamName: "",
-showWinProbability: JSON.parse(localStorage.getItem(PRO_MODE_KEY) || "false"), // Add try-catch here as well
-startTime: null,
-timerLastSavedAt: null
-    });
-  }
-}
 function saveCurrentGameState() {
-  if (state.gameOver) {
-    localStorage.removeItem(ACTIVE_GAME_KEY);
-    if (window.syncToFirestore && window.firebaseReady && window.firebaseAuth?.currentUser) {
-      window.syncToFirestore(ACTIVE_GAME_KEY, null);
-    }
-  } else {
-    const timerRunning = state.startTime !== null;
-    const now = Date.now();
-    const finalAccumulated = timerRunning
-      ? calculateSafeTimeAccumulation(state.accumulatedTime, state.startTime)
-      : Math.min(Number(state.accumulatedTime) || 0, MAX_GAME_TIME_MS);
-    const snapshot = {
-      ...state,
-      accumulatedTime: finalAccumulated,
-      startTime: timerRunning ? now : null,
-      timerLastSavedAt: now,
-      startingTotals: sanitizeTotals(state.startingTotals),
-    };
-    state.timerLastSavedAt = now;
-    setLocalStorage(ACTIVE_GAME_KEY, snapshot); // This now handles Firestore sync too
+  if (saveState()) {
     showSaveIndicator();
   }
 }
 
 // --- Team Stats Helpers ---
-function normalizeTeamsStorage(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { data: {}, changed: Boolean(raw && raw !== null) };
-  }
-
-  const working = { ...raw };
-  delete working.__storageVersion;
-
-  const entries = Object.entries(working);
-  if (!entries.length) {
-    return { data: {}, changed: raw.__storageVersion !== TEAM_STORAGE_VERSION };
-  }
-
-  const isAlreadyNew = entries.every(([, value]) => value && typeof value === 'object' && Array.isArray(value.players));
-  if (raw.__storageVersion === TEAM_STORAGE_VERSION && isAlreadyNew) {
-    const cleaned = {};
-    entries.forEach(([key, value]) => {
-      cleaned[key] = {
-        players: ensurePlayersArray(value.players),
-        displayName: deriveTeamDisplay(value.players, value.displayName || ''),
-        wins: Number(value.wins) || 0,
-        losses: Number(value.losses) || 0,
-        gamesPlayed: Number(value.gamesPlayed) || 0,
-      };
-    });
-    return { data: cleaned, changed: false };
-  }
-
-  const converted = {};
-  entries.forEach(([legacyName, payload]) => {
-    let players = [];
-    let stats = { wins: 0, losses: 0, gamesPlayed: 0 };
-
-    if (payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.players)) {
-      players = canonicalizePlayers(payload.players);
-      stats = {
-        wins: Number(payload.wins) || 0,
-        losses: Number(payload.losses) || 0,
-        gamesPlayed: Number(payload.gamesPlayed) || 0,
-      };
-    } else {
-      players = canonicalizePlayers(parseLegacyTeamName(legacyName));
-      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-        stats = {
-          wins: Number(payload.wins) || 0,
-          losses: Number(payload.losses) || 0,
-          gamesPlayed: Number(payload.gamesPlayed) || 0,
-        };
-      }
-    }
-
-    const key = buildTeamKey(players);
-    const displayName = deriveTeamDisplay(players, legacyName);
-    if (!converted[key]) {
-      converted[key] = { players: canonicalizePlayers(players), displayName, wins: 0, losses: 0, gamesPlayed: 0 };
-    }
-    converted[key].wins += stats.wins;
-    converted[key].losses += stats.losses;
-    converted[key].gamesPlayed += stats.gamesPlayed;
-    if (!converted[key].displayName) converted[key].displayName = displayName;
-  });
-
-  return { data: converted, changed: true };
-}
-
-function getTeamsObject() {
-  const raw = getLocalStorage("teams") || {};
-  const { data, changed } = normalizeTeamsStorage(raw);
-  if (changed) setTeamsObject(data);
-  return data;
-}
-
-function setTeamsObject(obj) {
-  const entries = {};
-  Object.entries(obj || {}).forEach(([key, value]) => {
-    if (!key || !value) return;
-    entries[key] = {
-      players: canonicalizePlayers(value.players),
-      displayName: deriveTeamDisplay(canonicalizePlayers(value.players), value.displayName || ''),
-      wins: Number(value.wins) || 0,
-      losses: Number(value.losses) || 0,
-      gamesPlayed: Number(value.gamesPlayed) || 0,
-    };
-  });
-  setLocalStorage("teams", { __storageVersion: TEAM_STORAGE_VERSION, ...entries });
-}
-
-function ensureTeamEntry(teamsObj, players, fallbackDisplay = '') {
-  const normalizedPlayers = canonicalizePlayers(players);
-  const key = buildTeamKey(normalizedPlayers);
-  if (!key) return { teams: teamsObj, key: null };
-  if (!teamsObj[key]) {
-    teamsObj[key] = {
-      players: normalizedPlayers,
-      displayName: deriveTeamDisplay(normalizedPlayers, fallbackDisplay || 'Unnamed Team'),
-      wins: 0,
-      losses: 0,
-      gamesPlayed: 0,
-    };
-  } else {
-    teamsObj[key].players = ensurePlayersArray(teamsObj[key].players);
-    if (!teamsObj[key].displayName) {
-      teamsObj[key].displayName = deriveTeamDisplay(normalizedPlayers, fallbackDisplay || 'Unnamed Team');
-    }
-  }
-  return { teams: teamsObj, key };
-}
-
-function applyTeamResultDelta(teamsObj, { usPlayers, demPlayers, usDisplay, demDisplay, winner }, direction = 1) {
-  if (!direction) return false;
-
-  const normalizedUs = canonicalizePlayers(usPlayers);
-  const normalizedDem = canonicalizePlayers(demPlayers);
-  const usName = deriveTeamDisplay(normalizedUs, usDisplay || 'Us') || 'Us';
-  const demName = deriveTeamDisplay(normalizedDem, demDisplay || 'Dem') || 'Dem';
-  const usKey = buildTeamKey(normalizedUs);
-  const demKey = buildTeamKey(normalizedDem);
-  if (!usKey || !demKey) return false;
-
-  if (direction > 0) {
-    ensureTeamEntry(teamsObj, normalizedUs, usName);
-    ensureTeamEntry(teamsObj, normalizedDem, demName);
-  }
-
-  const usEntry = teamsObj[usKey];
-  const demEntry = teamsObj[demKey];
-  if (!usEntry || !demEntry) return false;
-
-  const clamp = (value) => Math.max(0, Number.isFinite(value) ? value : 0);
-
-  usEntry.players = canonicalizePlayers(usEntry.players);
-  demEntry.players = canonicalizePlayers(demEntry.players);
-  if (!usEntry.displayName) usEntry.displayName = usName;
-  if (!demEntry.displayName) demEntry.displayName = demName;
-
-  usEntry.gamesPlayed = clamp((Number(usEntry.gamesPlayed) || 0) + direction);
-  demEntry.gamesPlayed = clamp((Number(demEntry.gamesPlayed) || 0) + direction);
-
-  if (winner === 'us') {
-    usEntry.wins = clamp((Number(usEntry.wins) || 0) + direction);
-    demEntry.losses = clamp((Number(demEntry.losses) || 0) + direction);
-  } else if (winner === 'dem') {
-    demEntry.wins = clamp((Number(demEntry.wins) || 0) + direction);
-    usEntry.losses = clamp((Number(usEntry.losses) || 0) + direction);
-  }
-
-  return true;
-}
-
-function updateTeamsStatsOnGameEnd(winner) {
-  const teams = getTeamsObject();
-  const updated = applyTeamResultDelta(teams, {
-    usPlayers: state.usPlayers,
-    demPlayers: state.demPlayers,
-    usDisplay: state.usTeamName,
-    demDisplay: state.demTeamName,
-    winner,
-  }, 1);
-  if (updated) setTeamsObject(teams);
-}
-function recalcTeamsStats() {
-  const teams = getTeamsObject();
-  Object.values(teams).forEach(entry => {
-    if (!entry) return;
-    entry.gamesPlayed = 0;
-    entry.wins = 0;
-    entry.losses = 0;
-  });
-
-  const accumulateFromGame = (game) => {
-    if (!game) return;
-    const usPlayers = canonicalizePlayers(game.usPlayers || parseLegacyTeamName(game.usTeamName || game.usName));
-    const demPlayers = canonicalizePlayers(game.demPlayers || parseLegacyTeamName(game.demTeamName || game.demName));
-    const usDisplay = deriveTeamDisplay(usPlayers, game.usTeamName || game.usName || 'Us');
-    const demDisplay = deriveTeamDisplay(demPlayers, game.demTeamName || game.demName || 'Dem');
-    const winner = game.winner === 'us' || game.winner === 'dem' ? game.winner : null;
-    applyTeamResultDelta(teams, { usPlayers, demPlayers, usDisplay, demDisplay, winner }, 1);
-  };
-
-  const savedGames = getLocalStorage('savedGames', []);
-  savedGames.forEach(accumulateFromGame);
-
-  if (state.gameOver && Array.isArray(state.rounds) && state.rounds.length) {
-    accumulateFromGame({
-      usPlayers: ensurePlayersArray(state.usPlayers),
-      demPlayers: ensurePlayersArray(state.demPlayers),
-      usTeamName: state.usTeamName,
-      demTeamName: state.demTeamName,
-      winner: state.winner,
-    });
-  }
-
-  setTeamsObject(teams);
-}
-function addTeamIfNotExists(players, display = '') {
-  const teams = getTeamsObject();
-  const { key } = ensureTeamEntry(teams, players, display);
-  if (key) setTeamsObject(teams);
-}
-
 // --- Menu & Modal Toggling ---
 function toggleMenu(e) {
   if (e) e.stopPropagation();
@@ -1038,7 +295,10 @@ function closeMenuOverlay() { toggleMenu(null); } // Simplified close
 
 function activateModalEnvironment() {
   document.body.classList.add("modal-open");
-  document.getElementById("app")?.classList.add("modal-active");
+  const appEl = document.getElementById("app");
+  if (appEl) {
+    appEl.classList.add("modal-active");
+  }
 }
 
 function deactivateModalEnvironment() {
@@ -1046,18 +306,26 @@ function deactivateModalEnvironment() {
     .some(modal => !modal.classList.contains("hidden"));
   if (!anyOpenModal) {
     document.body.classList.remove("modal-open");
-    document.getElementById("app")?.classList.remove("modal-active");
+    const appEl = document.getElementById("app");
+    if (appEl) {
+      appEl.classList.remove("modal-active");
+    }
   }
 }
 
 function openModal(modalId) {
   const modal = document.getElementById(modalId);
-  modal?.classList.remove("hidden");
+  if (modal) {
+    modal.classList.remove("hidden");
+    modal.focus();
+  }
   activateModalEnvironment();
-  modal?.focus(); // For accessibility
 }
 function closeModal(modalId) {
-  document.getElementById(modalId)?.classList.add("hidden");
+  const modal = document.getElementById(modalId);
+  if (modal) {
+    modal.classList.add("hidden");
+  }
   deactivateModalEnvironment();
 }
 function openSavedGamesModal() {
@@ -1175,13 +443,18 @@ function handleResumeGameSubmit(event) {
     errorEl.classList.add("hidden");
   }
 
+  const resumeUsPlayerOneEl = document.getElementById("resumeUsPlayerOne");
+  const resumeUsPlayerTwoEl = document.getElementById("resumeUsPlayerTwo");
+  const resumeDemPlayerOneEl = document.getElementById("resumeDemPlayerOne");
+  const resumeDemPlayerTwoEl = document.getElementById("resumeDemPlayerTwo");
+
   const usPlayers = ensurePlayersArray([
-    sanitizePlayerName(document.getElementById("resumeUsPlayerOne")?.value || ""),
-    sanitizePlayerName(document.getElementById("resumeUsPlayerTwo")?.value || ""),
+    sanitizePlayerName((resumeUsPlayerOneEl && resumeUsPlayerOneEl.value) || ""),
+    sanitizePlayerName((resumeUsPlayerTwoEl && resumeUsPlayerTwoEl.value) || ""),
   ]);
   const demPlayers = ensurePlayersArray([
-    sanitizePlayerName(document.getElementById("resumeDemPlayerOne")?.value || ""),
-    sanitizePlayerName(document.getElementById("resumeDemPlayerTwo")?.value || ""),
+    sanitizePlayerName((resumeDemPlayerOneEl && resumeDemPlayerOneEl.value) || ""),
+    sanitizePlayerName((resumeDemPlayerTwoEl && resumeDemPlayerTwoEl.value) || ""),
   ]);
 
   const startingTotals = sanitizeTotals({ us: usScore, dem: demScore });
@@ -1229,7 +502,10 @@ function openSettingsModal() {
   if (mustWinToggle) mustWinToggle.checked = JSON.parse(localStorage.getItem(MUST_WIN_BY_BID_KEY) || "false");
   const proToggleModal = document.getElementById("proModeToggleModal");
   if (proToggleModal) proToggleModal.checked = JSON.parse(localStorage.getItem(PRO_MODE_KEY) || "false");
-  document.getElementById('editPresetsContainerModal')?.classList.remove('hidden'); // Always show
+  const presetsContainer = document.getElementById('editPresetsContainerModal');
+  if (presetsContainer) {
+    presetsContainer.classList.remove('hidden'); // Always show
+  }
 
   // Load all settings using the common function
   loadSettings();
@@ -1285,10 +561,6 @@ function openZeroPointsModal(callback) {
     closeModal("zeroPointsModal");
     // No callback on cancel
   });
-}
-
-function closeZeroPointsModal() {
-  closeModal("zeroPointsModal");
 }
 
 // --- Game Actions & Logic ---
@@ -1933,7 +1205,10 @@ function saveSettings() {
   showSaveIndicator("Settings Saved");
 }
 function updateProModeUI(isProMode) {
-  document.getElementById('editPresetsContainerModal')?.classList.remove('hidden'); // Always show
+  const presetsContainer = document.getElementById('editPresetsContainerModal');
+  if (presetsContainer) {
+    presetsContainer.classList.remove('hidden'); // Always show
+  }
   const proToggleModal = document.getElementById("proModeToggleModal");
   if (proToggleModal) proToggleModal.checked = isProMode;
   updateState({ showWinProbability: isProMode }); // Update live state
@@ -2007,27 +1282,6 @@ function validatePoints(pointsStr) {
 function showVersionNum() {
   alert("Version 1.5.0 (Build 1) Adds a new glass-like feel, point differential display, individual statistics, cleaner team handling & more bug fixes / UI improvements.");
 }
-// Time protection constants
-const MAX_GAME_TIME_MS = 10 * 60 * 60 * 1000; // 10 hours maximum
-const MAX_ROUND_TIME_MS = 2 * 60 * 60 * 1000; // 2 hours maximum per round
-
-function calculateSafeTimeAccumulation(currentAccumulated, startTime) {
-  if (!startTime) return currentAccumulated;
-
-  const elapsed = Date.now() - startTime;
-  const cappedElapsed = Math.min(elapsed, MAX_ROUND_TIME_MS);
-  const totalTime = currentAccumulated + cappedElapsed;
-
-  // Cap the total game time as well
-  return Math.min(totalTime, MAX_GAME_TIME_MS);
-}
-
-function getCurrentGameTime() {
-  if (!state.startTime) return state.accumulatedTime;
-  const elapsed = Date.now() - state.startTime;
-  return state.accumulatedTime + elapsed;
-}
-
 function renderTimeWarning() {
   if (!state.startTime || state.gameOver) return "";
 
@@ -2125,247 +1379,9 @@ function generateProbabilityBreakdown() {
   const labelUs = state.usTeamName || "Us";
   const labelDem = state.demTeamName || "Dem";
 
-  return generateComplexProbabilityBreakdown(scoreDiff, roundsPlayed, labelUs, labelDem, winProb, historicalGames, currentScores);
+  return renderProbabilityBreakdown(scoreDiff, roundsPlayed, labelUs, labelDem, winProb, historicalGames, currentScores);
 }
 
-function generateComplexProbabilityBreakdown(scoreDiff, roundsPlayed, labelUs, labelDem, winProb, historicalGames, currentScores) {
-  // Get the probability table for complex analysis
-  const cacheKey = historicalGames.length;
-  if (!PROB_CACHE.has(cacheKey)) {
-    PROB_CACHE.set(cacheKey, buildProbabilityIndex(historicalGames));
-  }
-  const table = PROB_CACHE.get(cacheKey);
-
-  // Calculate the bucketed score and key for this situation
-  const bucketedScore = bucketScore(scoreDiff);
-  const key = `${roundsPlayed - 1}|${bucketedScore}`;
-  const counts = table[key] || { us: 1, dem: 1 };
-  const empirical = counts.us / (counts.us + counts.dem);
-  const totalObs = counts.us + counts.dem - 2; // Remove Laplace prior
-  const beta = Math.min(1, Math.log(totalObs + 1) / 4);
-  const prior = 1 / (1 + Math.exp(-0.015 * scoreDiff));
-
-  // Score bucketing analysis
-  const bucketAnalysis = (() => {
-    const bucketRange = getBucketRange(bucketedScore);
-    const bucketSize = Math.abs(bucketedScore);
-    let bucketDescription = "";
-
-    if (bucketSize === 0) {
-      bucketDescription = "Tied games (0 points)";
-    } else if (bucketSize <= 130) {
-      bucketDescription = `Close games (${bucketRange})`;
-    } else if (bucketSize <= 180) {
-      bucketDescription = `Large leads (${bucketRange})`;
-    } else {
-      bucketDescription = `Dominant positions (${bucketRange})`;
-    }
-
-    return {
-      bucketedScore,
-      bucketDescription,
-      bucketRange
-    };
-  })();
-
-  // Historical pattern analysis
-  const historicalAnalysis = (() => {
-    const relevantGames = historicalGames.filter(game => {
-      return game.rounds && game.rounds.length > 0 && game.finalScore;
-    });
-
-    if (relevantGames.length === 0) {
-      return {
-        text: "No historical data",
-        explanation: "Using mathematical model only",
-        empiricalRate: 0,
-        totalObservations: 0
-      };
-    }
-
-    // Count games from this bucket
-    let bucketGames = 0;
-    let bucketWins = 0;
-
-    Object.keys(table).forEach(tableKey => {
-      if (tableKey.includes(`|${bucketedScore}`)) {
-        const keyRound = parseInt(tableKey.split('|')[0]);
-        if (Math.abs(keyRound - (roundsPlayed - 1)) <= 1) { // Similar round
-          bucketGames += table[tableKey].us + table[tableKey].dem - 2;
-          bucketWins += table[tableKey].us - 1;
-        }
-      }
-    });
-
-    return {
-      text: `${relevantGames.length} games analyzed`,
-      explanation: `Found ${bucketGames} similar situations in historical data`,
-      empiricalRate: bucketGames > 0 ? (bucketWins / bucketGames) : 0,
-      totalObservations: bucketGames,
-      bucketWins,
-      bucketGames
-    };
-  })();
-
-  // Blending analysis
-  const blendingAnalysis = (() => {
-    const empiricalWeight = Math.round(beta * 100);
-    const priorWeight = Math.round((1 - beta) * 100);
-    const empiricalPercent = Math.round(empirical * 100);
-    const priorPercent = Math.round(prior * 100);
-
-    let confidence = "Low";
-    if (totalObs >= 50) confidence = "Very High";
-    else if (totalObs >= 20) confidence = "High";
-    else if (totalObs >= 10) confidence = "Medium";
-    else if (totalObs >= 5) confidence = "Low-Medium";
-
-    return {
-      empiricalWeight,
-      priorWeight,
-      empiricalPercent,
-      priorPercent,
-      confidence,
-      totalObservations: totalObs
-    };
-  })();
-
-  // Recency weighting analysis
-  const recencyAnalysis = (() => {
-    const recentGames = historicalGames.filter(game => {
-      if (!game.timestamp) return false;
-      const ageDays = (Date.now() - new Date(game.timestamp)) / 86_400_000;
-      return ageDays <= 30; // Games within 30 days
-    });
-
-    const olderGames = historicalGames.length - recentGames.length;
-
-    return {
-      recentGames: recentGames.length,
-      olderGames,
-      explanation: `Recent games (≤30 days) weighted more heavily than older games`
-    };
-  })();
-
-  return `
-    <div class="space-y-4">
-      <!-- Header -->
-      <div class="text-center border-b border-gray-200 dark:border-gray-700 pb-3">
-        <div class="text-xl font-bold text-gray-800 dark:text-white mb-1">
-          Logistic Regression Win Probability Analysis
-        </div>
-        <div class="flex items-center justify-center gap-6 text-lg">
-          <div class="flex items-center gap-2">
-            <div class="w-3 h-3 rounded-full bg-primary"></div>
-            <span class="font-semibold text-white">${labelUs}: ${winProb.us.toFixed(1)}%</span>
-          </div>
-          <div class="flex items-center gap-2">
-            <div class="w-3 h-3 rounded-full bg-accent"></div>
-            <span class="font-semibold text-white">${labelDem}: ${winProb.dem.toFixed(1)}%</span>
-          </div>
-        </div>
-        <div class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-          Method: Logistic Regression • Confidence: ${blendingAnalysis.confidence}
-        </div>
-      </div>
-
-      <!-- Current Situation -->
-      <div class="space-y-3">
-        <h3 class="font-semibold text-gray-800 dark:text-white">Current Situation</h3>
-
-        <div class="bg-gradient-to-r from-blue-50 to-blue-100 dark:from-blue-900/30 dark:to-blue-800/30 rounded-lg p-3">
-          <div class="flex justify-between items-start mb-2">
-            <div class="font-medium text-gray-700 dark:text-gray-300">Score Classification</div>
-            <div class="text-sm text-blue-700 dark:text-blue-300 font-medium">${bucketAnalysis.bucketDescription}</div>
-          </div>
-          <div class="text-sm text-gray-600 dark:text-gray-400">
-            <strong>Current:</strong> ${currentScores.us} - ${currentScores.dem} 
-            ${Math.abs(scoreDiff) > 0 ? `(${Math.abs(scoreDiff)} point ${scoreDiff > 0 ? labelUs : labelDem} lead)` : '(Tied)'}
-          </div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            Bucketed as: ${bucketAnalysis.bucketRange} • Round ${roundsPlayed}
-          </div>
-        </div>
-      </div>
-
-      <!-- Statistical Analysis -->
-      <div class="space-y-3">
-        <h3 class="font-semibold text-gray-800 dark:text-white">Statistical Analysis</h3>
-
-        <div class="bg-gradient-to-r from-green-50 to-green-100 dark:from-green-900/30 dark:to-green-800/30 rounded-lg p-3">
-          <div class="flex justify-between items-start mb-2">
-            <div class="font-medium text-gray-700 dark:text-gray-300">Historical Pattern</div>
-            <div class="text-sm text-green-700 dark:text-green-300 font-medium">${historicalAnalysis.empiricalRate > 0 ? `${Math.round(historicalAnalysis.empiricalRate * 100)}% historical win rate` : 'No similar data'}</div>
-          </div>
-          <div class="text-sm text-gray-600 dark:text-gray-400">
-            <strong>Data:</strong> ${historicalAnalysis.totalObservations} similar situations found
-          </div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            ${historicalAnalysis.explanation}
-          </div>
-        </div>
-
-        <div class="bg-gradient-to-r from-purple-50 to-purple-100 dark:from-purple-900/30 dark:to-purple-800/30 rounded-lg p-3">
-          <div class="flex justify-between items-start mb-2">
-            <div class="font-medium text-gray-700 dark:text-gray-300">Probability Blending</div>
-            <div class="text-sm text-purple-700 dark:text-purple-300 font-medium">${blendingAnalysis.empiricalWeight}% Historical + ${blendingAnalysis.priorWeight}% Mathematical</div>
-          </div>
-          <div class="text-sm text-gray-600 dark:text-gray-400">
-            <strong>Components:</strong> ${blendingAnalysis.empiricalPercent}% (data) + ${blendingAnalysis.priorPercent}% (model) = ${winProb.us.toFixed(1)}%
-          </div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            Based on ${blendingAnalysis.totalObservations} observations. More data = higher historical weight.
-          </div>
-        </div>
-
-        <div class="bg-gradient-to-r from-orange-50 to-orange-100 dark:from-orange-900/30 dark:to-orange-800/30 rounded-lg p-3">
-          <div class="flex justify-between items-start mb-2">
-            <div class="font-medium text-gray-700 dark:text-gray-300">Recency Weighting</div>
-            <div class="text-sm text-orange-700 dark:text-orange-300 font-medium">${recencyAnalysis.recentGames} recent, ${recencyAnalysis.olderGames} older</div>
-          </div>
-          <div class="text-sm text-gray-600 dark:text-gray-400">
-            <strong>Impact:</strong> Recent games matter more than older ones
-          </div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            ${recencyAnalysis.explanation}
-          </div>
-        </div>
-      </div>
-
-      <!-- How It Works -->
-      <div class="border-t border-gray-200 dark:border-gray-700 pt-3">
-        <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-          <h4 class="font-medium text-gray-800 dark:text-white mb-2">How This Calculation Works (Logistic Regression Method)</h4>
-          <div class="text-xs text-gray-600 dark:text-gray-400 space-y-1">
-            <p>• <strong>Feature Extraction:</strong> Each round generates features: score difference, round number, and momentum (change in score diff)</p>
-            <p>• <strong>Logistic Regression Model:</strong> Trained on historical game data to predict win probability using these three key features</p>
-            <p>• <strong>Momentum Analysis:</strong> Captures recent performance trends by tracking how the score difference changes between rounds</p>
-            <p>• <strong>Stage-Aware Modeling:</strong> Round number helps the model understand that early vs. late game situations matter differently</p>
-            <p>• <strong>Continuous Learning:</strong> Model can be retrained as more game data becomes available for improved accuracy</p>
-          </div>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-2 italic">
-            This machine learning approach uses logistic regression to learn patterns from actual game outcomes, providing data-driven win probability estimates that improve with more training data.
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function getBucketRange(bucketedScore) {
-  const abs = Math.abs(bucketedScore);
-  if (abs === 0) return "0";
-  if (abs === 20) return "0-19";
-  if (abs === 40) return "20-39";
-  if (abs === 60) return "40-59";
-  if (abs === 80) return "60-79";
-  if (abs === 100) return "80-99";
-  if (abs === 120) return "100-119";
-  if (abs === 140) return "120-139";
-  if (abs === 160) return "140-159";
-  if (abs === 180) return "160+";
-  return `${abs}`;
-}
 function populateTeamSelects() {
   const teamsObj = getTeamsObject();
   const entrySortFn = (a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' });
@@ -2425,13 +1441,18 @@ function populateTeamSelects() {
 function handleTeamSelectionSubmit(e) {
   e.preventDefault();
 
+  const usPlayerOneInput = document.getElementById("usPlayerOne");
+  const usPlayerTwoInput = document.getElementById("usPlayerTwo");
+  const demPlayerOneInput = document.getElementById("demPlayerOne");
+  const demPlayerTwoInput = document.getElementById("demPlayerTwo");
+
   const usPlayers = ensurePlayersArray([
-    document.getElementById("usPlayerOne")?.value,
-    document.getElementById("usPlayerTwo")?.value,
+    usPlayerOneInput ? usPlayerOneInput.value : "",
+    usPlayerTwoInput ? usPlayerTwoInput.value : "",
   ]);
   const demPlayers = ensurePlayersArray([
-    document.getElementById("demPlayerOne")?.value,
-    document.getElementById("demPlayerTwo")?.value,
+    demPlayerOneInput ? demPlayerOneInput.value : "",
+    demPlayerTwoInput ? demPlayerTwoInput.value : "",
   ]);
 
   if (!usPlayers[0] || !usPlayers[1]) {
@@ -2494,10 +1515,16 @@ function handleBugReportClick() {
     const deviceDetails = getDeviceDetails();
     let appStateString = "Could not retrieve app state.";
     try {
+      const roundsArray = Array.isArray(state.rounds) ? state.rounds : [];
+      const lastRound = roundsArray.length ? roundsArray[roundsArray.length - 1] : null;
+      const lastTotals = lastRound && lastRound.runningTotals ? lastRound.runningTotals : {};
+      const lastUsScore = typeof lastTotals.us === "number" ? lastTotals.us : 0;
+      const lastDemScore = typeof lastTotals.dem === "number" ? lastTotals.dem : 0;
+      const roundsPlayed = roundsArray.length;
       appStateString = [
         `Teams: ${state.usTeamName || "Us"} vs ${state.demTeamName || "Dem"}`,
-        `Scores: Us ${state.rounds?.[state.rounds.length-1]?.runningTotals?.us ?? 0} - Dem ${state.rounds?.[state.rounds.length-1]?.runningTotals?.dem ?? 0}`,
-        `Rounds played: ${state.rounds?.length ?? 0}`,
+        `Scores: Us ${lastUsScore} - Dem ${lastDemScore}`,
+        `Rounds played: ${roundsPlayed}`,
         `Game Over: ${state.gameOver ? "Yes" : "No"}`,
         `Winner: ${state.winner || "N/A"}`,
         `Victory Method: ${state.victoryMethod || "N/A"}`
@@ -2788,7 +1815,8 @@ function renderGameOverOverlay() {
 function renderReadOnlyGameDetails(game) {
   const { rounds, timestamp, usTeamName, demTeamName, durationMs, winner, finalScore, victoryMethod } = game;
   const usDisp = usTeamName || "Us", demDisp = demTeamName || "Dem";
-  const usScore = finalScore?.us || 0, demScore = finalScore?.dem || 0;
+  const usScore = finalScore && typeof finalScore.us === "number" ? finalScore.us : 0;
+  const demScore = finalScore && typeof finalScore.dem === "number" ? finalScore.dem : 0;
   const usWinner = winner === "us", demWinner = winner === "dem";
   const dateStr = new Date(timestamp).toLocaleString([], { year:"numeric", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" });
 
@@ -2945,8 +1973,8 @@ function renderGamesList({ storageKey, containerId, emptyMessageId, emptySearchM
 function buildSavedGameCard(game, originalIndex) {
   const usDisplay = getGameTeamDisplay(game, 'us');
   const demDisplay = getGameTeamDisplay(game, 'dem');
-  const usScore = game.finalScore?.us ?? 0;
-  const demScore = game.finalScore?.dem ?? 0;
+  const usScore = game.finalScore && typeof game.finalScore.us === "number" ? game.finalScore.us : 0;
+  const demScore = game.finalScore && typeof game.finalScore.dem === "number" ? game.finalScore.dem : 0;
   const usWon = game.winner === 'us';
   const demWon = game.winner === 'dem';
   const timestamp = game.timestamp ? new Date(game.timestamp).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown date';
@@ -2981,8 +2009,8 @@ function buildSavedGameCard(game, originalIndex) {
 function buildFreezerGameCard(game, originalIndex) {
   const usDisplay = getGameTeamDisplay(game, 'us');
   const demDisplay = getGameTeamDisplay(game, 'dem');
-  const usScore = game.finalScore?.us ?? 0;
-  const demScore = game.finalScore?.dem ?? 0;
+  const usScore = game.finalScore && typeof game.finalScore.us === "number" ? game.finalScore.us : 0;
+  const demScore = game.finalScore && typeof game.finalScore.dem === "number" ? game.finalScore.dem : 0;
   const timestamp = game.timestamp ? new Date(game.timestamp).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown date';
   const leadInfo = usScore > demScore
     ? `${usDisplay} leads by ${usScore - demScore}`
@@ -3045,7 +2073,6 @@ function sortGamesBy(entries, sortOption = 'newest') {
   }
   return sorted;
 }
-function detectSandbag(rounds, winner, threshold = 2) { /* Placeholder */ return "N/A"; }
 // --- Statistics Modal Rendering ---
 function renderStatisticsContent() {
   const stats = getStatistics();
@@ -3378,7 +2405,8 @@ function renderStatsTable(mode, statsData, additionalStatKey) {
       bidSuccessPct: item.bidSuccessPct,
       sandbagger: item.sandbagger,
     };
-    let statVal = lookup[additionalStatKey] ?? '0';
+    let statVal = lookup[additionalStatKey];
+    if (statVal === undefined || statVal === null) statVal = '0';
     if (additionalStatKey.includes('Pct') && typeof statVal === 'string' && !statVal.includes('%') && statVal !== 'N/A') statVal += '%';
 
     const displayName = mode === 'teams' ? item.name : item.name;
@@ -3584,11 +2612,87 @@ function performTeamPlayerMigration() {
   }
 }
 
+const globalBindings = {
+  toggleMenu,
+  closeMenuOverlay,
+  openSavedGamesModal,
+  closeSavedGamesModal,
+  handleNewGame,
+  handleFreezerGame,
+  openSettingsModal,
+  closeSettingsModal,
+  openAboutModal,
+  closeAboutModal,
+  openStatisticsModal,
+  closeStatisticsModal,
+  showVersionNum,
+  switchGamesTab,
+  filterGames,
+  sortGames,
+  handleBugReportClick,
+  handleTeamSelectionCancel,
+  openThemeModal,
+  closeThemeModal,
+  randomizeThemeColors,
+  applyCustomThemeColors,
+  resetThemeColors,
+  updatePreview,
+  initializeCustomThemeColors,
+  openPresetEditorModal,
+  closePresetEditorModal,
+  validatePresetInput,
+  addPreset,
+  removePreset,
+  savePresets,
+  applyTableTalkPenalty,
+  openTableTalkModal,
+  closeTableTalkModal,
+  handleTableTalkPenaltyChange,
+  handlePenaltyPointsChange,
+  toggleProMode,
+  handleUndo,
+  handleRedo,
+  handleBidSelect,
+  handleBiddingPointsToggle,
+  openZeroPointsModal,
+  handleGameOverFixClick,
+  handleGameOverSaveClick,
+  openProbabilityModal,
+  closeProbabilityModal,
+  handleFormSubmit,
+  handleTeamClick,
+  handleManualSaveGame,
+  openResumeGameModal,
+  closeResumeGameModal,
+  handleResumeGameSubmit,
+  openTeamSelectionModal,
+  closeTeamSelectionModal,
+  handleTeamSelectionSubmit,
+  openConfirmationModal,
+  closeConfirmationModal,
+  viewSavedGame,
+  closeViewSavedGameModal,
+  deleteSavedGame,
+  deleteFreezerGame,
+  loadFreezerGame,
+  handleDeleteTeam,
+  loadCurrentGameState,
+  saveCurrentGameState,
+  resetGame,
+  renderApp,
+  performTeamPlayerMigration,
+};
+
+Object.assign(window, globalBindings);
+
 // --- Initialization ---
 document.addEventListener("DOMContentLoaded", () => {
   performTeamPlayerMigration();
   document.body.classList.remove('modal-open');
-  document.getElementById('app')?.classList.remove('modal-active');
+  const appEl = document.getElementById('app');
+  if (appEl) {
+    appEl.classList.remove('modal-active');
+  }
   document.querySelectorAll('.modal').forEach(modal => modal.classList.add('hidden'));
   enforceDarkMode();
   initializeTheme(); // Predefined themes
@@ -3604,9 +2708,18 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   updateProModeUI(getLocalStorage(PRO_MODE_KEY, false)); // Initial UI update
 
-  document.getElementById("closeViewSavedGameModalBtn")?.addEventListener("click", (e) => { e.stopPropagation(); closeViewSavedGameModal(); });
-  document.getElementById("closeSavedGamesModalBtn")?.addEventListener("click", (e) => { e.stopPropagation(); closeSavedGamesModal(); });
-  document.getElementById("teamSelectionForm")?.addEventListener("submit", handleTeamSelectionSubmit);
+  const closeViewSavedGameModalBtn = document.getElementById("closeViewSavedGameModalBtn");
+  if (closeViewSavedGameModalBtn) {
+    closeViewSavedGameModalBtn.addEventListener("click", (e) => { e.stopPropagation(); closeViewSavedGameModal(); });
+  }
+  const closeSavedGamesModalBtn = document.getElementById("closeSavedGamesModalBtn");
+  if (closeSavedGamesModalBtn) {
+    closeSavedGamesModalBtn.addEventListener("click", (e) => { e.stopPropagation(); closeSavedGamesModal(); });
+  }
+  const teamSelectionForm = document.getElementById("teamSelectionForm");
+  if (teamSelectionForm) {
+    teamSelectionForm.addEventListener("submit", handleTeamSelectionSubmit);
+  }
   const resumePaperGameButton = document.getElementById("resumePaperGameButton");
   if (resumePaperGameButton) {
     resumePaperGameButton.addEventListener("click", (event) => {
@@ -3615,6 +2728,12 @@ document.addEventListener("DOMContentLoaded", () => {
       toggleMenu(event);
     });
   }
+  let touchStartX = 0;
+  document.body.addEventListener('touchstart', (e) => {
+      if (e.changedTouches && e.changedTouches.length) {
+          touchStartX = e.changedTouches[0].clientX;
+      }
+  }, { passive: true });
 
   // Close modals on outside click (simplified)
   const modalCloseHandlers = {
@@ -3641,6 +2760,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
   document.body.addEventListener('touchend', e => {
+      if (!e.changedTouches || !e.changedTouches.length) return;
       const touchEndX = e.changedTouches[0].clientX;
       const menu = document.getElementById("menu");
       if (!menu) return;
@@ -3655,6 +2775,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
 if ('serviceWorker' in navigator) {
   let refreshing;
+  // Proactively ask existing registrations to check for updates
+  try {
+    navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(r => r.update().catch(() => {})));
+  } catch (_) {}
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (refreshing) return;
     window.location.reload();
@@ -3787,9 +2911,7 @@ if (typeof module !== 'undefined' && module.exports) {
     deriveTeamDisplay,
     getGameTeamDisplay,
     playersEqual,
-    bucketScore,
-    buildProbabilityIndex,
-    calculateWinProbabilityComplex,
     calculateWinProbability,
+    renderProbabilityBreakdown,
   };
 }

@@ -1,4 +1,5 @@
-const CACHE_NAME = "rook-cache-v1.5.0-b1";
+// Bump cache version to invalidate old cached JS assets
+const CACHE_NAME = "rook-cache-v1.5.0-b2";
 const OFFLINE_URL = "index.html"; // Use relative path
 
 const urlsToCache = [
@@ -43,20 +44,33 @@ self.addEventListener("fetch", (event) => {
        .catch(() => caches.match("./index.html")) // offline fallback
    );
   } else {
-    // Handle other assets (scripts, images, etc.)
+    const req = event.request;
+    const url = new URL(req.url);
+
+    // Network-first for JavaScript to avoid stale app code
+    if (req.destination === 'script' || url.pathname.endsWith('.js')) {
+      event.respondWith(
+        fetch(req)
+          .then((networkResponse) => {
+            if (networkResponse && networkResponse.status === 200) {
+              const clone = networkResponse.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(req, clone));
+            }
+            return networkResponse;
+          })
+          .catch(() => caches.match(req))
+      );
+      return;
+    }
+
+    // Cache-first for other assets (images, vendor libs, etc.)
     event.respondWith(
-      caches.match(event.request).then((cachedResponse) => {
-        if (cachedResponse) {
-          return cachedResponse;
-        }
-        
-        return fetch(event.request).then((networkResponse) => {
-          // Cache successful same-origin responses for future offline use
-          if (networkResponse && networkResponse.status === 200 && networkResponse.type === "basic") {
-            const responseClone = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseClone);
-            });
+      caches.match(req).then((cached) => {
+        if (cached) return cached;
+        return fetch(req).then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
+            const clone = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(req, clone));
           }
           return networkResponse;
         });
